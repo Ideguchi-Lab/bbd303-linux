@@ -1,0 +1,14 @@
+.private_research/
+.ipynb_checkpoints/
+config.toml
+*.log
+*.jsonl
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.venv/

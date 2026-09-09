@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bbd303-control"
+version = "0.1.0"
+description = "Native Linux control of a Thorlabs BBD303 through the XA SDK"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "BBD303 Linux control contributors" }]
+dependencies = ["thorlabs-xa==1.4.0.28472"]
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.7,<7"]
+dev = ["pytest>=8,<9"]
+
+[project.scripts]
+bbd303 = "bbd303.cli:main"
+bbd303-gui = "bbd303.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+

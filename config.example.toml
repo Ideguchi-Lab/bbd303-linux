@@ -1,0 +1,12 @@
+[controller]
+serial = "REPLACE_WITH_CONTROLLER_SERIAL"
+model = "BBD303"
+port = 40303
+scan_subnets = ["192.0.2.0/24"]
+
+[axes.x]
+expected_stage = "MLS203 X Axis"
+
+[axes.y]
+expected_stage = "MLS203 Y Axis"
+
