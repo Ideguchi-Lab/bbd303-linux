@@ -26,6 +26,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from .controller import BBD303Controller
     from .errors import DeviceStateError, MotionTimeoutError
+    from .gui_state import GuiAxisSettings, GuiStateStore
     from .models import Axis
 
     class ControllerWorker(QtCore.QObject):
@@ -223,6 +224,9 @@ def main(argv: list[str] | None = None) -> int:
         stop_requested = QtCore.Signal(str)
         enabled_requested = QtCore.Signal(str, bool)
         home_requested = QtCore.Signal(str)
+        settings_changed = QtCore.Signal(str)
+        save_default_requested = QtCore.Signal(str)
+        restore_default_requested = QtCore.Signal(str)
 
         def __init__(self, axis: Axis):
             super().__init__(f"{axis.value.upper()} axis")
@@ -275,6 +279,16 @@ def main(argv: list[str] | None = None) -> int:
             self.plus_button = QtWidgets.QPushButton("+")
             self.minus_button.clicked.connect(lambda: self._relative(-1))
             self.plus_button.clicked.connect(lambda: self._relative(1))
+            self.save_default_button = QtWidgets.QPushButton("Save as Default")
+            self.restore_default_button = QtWidgets.QPushButton("Restore Default")
+            self.save_default_button.clicked.connect(
+                lambda: self.save_default_requested.emit(self.axis)
+            )
+            self.restore_default_button.clicked.connect(
+                lambda: self.restore_default_requested.emit(self.axis)
+            )
+            for field in (self.velocity, self.acceleration, self.step):
+                field.valueChanged.connect(lambda _value: self.settings_changed.emit(self.axis))
 
             move_page = QtWidgets.QWidget()
             move_layout = QtWidgets.QGridLayout(move_page)
@@ -289,7 +303,11 @@ def main(argv: list[str] | None = None) -> int:
             move_layout.addWidget(self.step, 4, 1, 1, 2)
             move_layout.addWidget(self.minus_button, 5, 1)
             move_layout.addWidget(self.plus_button, 5, 2)
-            move_layout.setRowStretch(6, 1)
+            defaults_row = QtWidgets.QHBoxLayout()
+            defaults_row.addWidget(self.save_default_button)
+            defaults_row.addWidget(self.restore_default_button)
+            move_layout.addLayout(defaults_row, 6, 0, 1, 3)
+            move_layout.setRowStretch(7, 1)
 
             tabs = QtWidgets.QTabWidget()
             tabs.addTab(move_page, "Move")
@@ -320,14 +338,34 @@ def main(argv: list[str] | None = None) -> int:
             layout.addWidget(tabs, 1)
             self._update_controls()
 
-        def configure(self, stage, motion):
+        def configure(self, stage, settings):
             self.target.setRange(stage.min_position_mm, stage.max_position_mm)
             self.velocity.setRange(0.0001, stage.max_velocity_mm_s)
             self.acceleration.setRange(0.001, stage.max_acceleration_mm_s2)
-            self.velocity.setValue(motion.max_velocity_mm_s)
-            self.acceleration.setValue(motion.acceleration_mm_s2)
+            self.step.setMaximum(
+                (stage.max_position_mm - stage.min_position_mm) * 1000.0
+            )
+            self.apply_settings(settings)
             self.connected = True
             self._update_controls()
+
+        def apply_settings(self, settings):
+            blockers = [
+                QtCore.QSignalBlocker(self.velocity),
+                QtCore.QSignalBlocker(self.acceleration),
+                QtCore.QSignalBlocker(self.step),
+            ]
+            self.velocity.setValue(settings.velocity_mm_s)
+            self.acceleration.setValue(settings.acceleration_mm_s2)
+            self.step.setValue(settings.relative_step_um)
+            del blockers
+
+        def current_settings(self):
+            return GuiAxisSettings(
+                velocity_mm_s=self.velocity.value(),
+                acceleration_mm_s2=self.acceleration.value(),
+                relative_step_um=self.step.value(),
+            )
 
         def set_connected(self, connected):
             self.connected = connected
@@ -346,7 +384,7 @@ def main(argv: list[str] | None = None) -> int:
             for widget in (
                 self.target, self.velocity, self.acceleration, self.move_button,
                 self.step, self.minus_button, self.plus_button, self.enable_button,
-                self.home_button,
+                self.home_button, self.save_default_button, self.restore_default_button,
             ):
                 widget.setEnabled(move_enabled)
             self.stop_button.setEnabled(self.connected)
@@ -428,6 +466,8 @@ def main(argv: list[str] | None = None) -> int:
             self.event_queue = event_queue
             self.shutting_down = False
             self.may_close = False
+            self.state_store = GuiStateStore()
+            self.pending_state_axes = set()
             self.setWindowTitle("BBD303 Control")
             self.resize(920, 560)
             self.connection_label = QtWidgets.QLabel("Disconnected")
@@ -446,6 +486,9 @@ def main(argv: list[str] | None = None) -> int:
                 panel.stop_requested.connect(self.stop_requested)
                 panel.enabled_requested.connect(self.enabled_requested)
                 panel.home_requested.connect(self.home_requested)
+                panel.settings_changed.connect(self._schedule_state_save)
+                panel.save_default_requested.connect(self._save_default)
+                panel.restore_default_requested.connect(self._restore_default)
             layout = QtWidgets.QVBoxLayout()
             layout.addLayout(top)
             layout.addLayout(axes_layout, 1)
@@ -457,6 +500,57 @@ def main(argv: list[str] | None = None) -> int:
             self.event_timer.setInterval(50)
             self.event_timer.timeout.connect(self._drain_worker_events)
             self.event_timer.start()
+            self.state_save_timer = QtCore.QTimer(self)
+            self.state_save_timer.setSingleShot(True)
+            self.state_save_timer.setInterval(300)
+            self.state_save_timer.timeout.connect(self._flush_gui_state)
+            if self.state_store.warning:
+                self.statusBar().showMessage(self.state_store.warning, 10000)
+
+        @QtCore.Slot(str)
+        def _schedule_state_save(self, axis):
+            self.pending_state_axes.add(Axis.parse(axis))
+            self.state_save_timer.start()
+
+        @QtCore.Slot()
+        def _flush_gui_state(self):
+            if not self.pending_state_axes:
+                return True
+            axes = tuple(self.pending_state_axes)
+            try:
+                for axis in axes:
+                    self.state_store.set_last(axis, self.panels[axis].current_settings())
+                self.state_store.save()
+                self.pending_state_axes.difference_update(axes)
+                return True
+            except (OSError, ValueError) as exc:
+                self.statusBar().showMessage(f"Could not save GUI settings: {exc}", 10000)
+                return False
+
+        @QtCore.Slot(str)
+        def _save_default(self, axis):
+            parsed = Axis.parse(axis)
+            try:
+                settings = self.panels[parsed].current_settings()
+                self.state_store.set_defaults(parsed, settings)
+                self.state_store.set_last(parsed, settings)
+                self.state_store.save()
+                self.pending_state_axes.discard(parsed)
+                self.statusBar().showMessage(
+                    f"Saved {parsed.value.upper()} settings as defaults", 5000
+                )
+            except (OSError, ValueError) as exc:
+                self.statusBar().showMessage(f"Could not save GUI defaults: {exc}", 10000)
+
+        @QtCore.Slot(str)
+        def _restore_default(self, axis):
+            parsed = Axis.parse(axis)
+            self.panels[parsed].apply_settings(self.state_store.defaults(parsed))
+            self.pending_state_axes.add(parsed)
+            if self._flush_gui_state():
+                self.statusBar().showMessage(
+                    f"Restored {parsed.value.upper()} defaults", 5000
+                )
 
         @QtCore.Slot()
         def _drain_worker_events(self):
@@ -495,8 +589,8 @@ def main(argv: list[str] | None = None) -> int:
                 f"{info.model} | firmware {info.firmware} | {info.connection}"
             )
             for axis, panel in self.panels.items():
-                stage, motion = axes[axis]
-                panel.configure(stage, motion)
+                stage, _motion = axes[axis]
+                panel.configure(stage, self.state_store.last(axis))
             self.statusBar().showMessage("Connected")
 
         @QtCore.Slot(object)
@@ -528,6 +622,7 @@ def main(argv: list[str] | None = None) -> int:
 
         def closeEvent(self, event):
             if self.may_close:
+                self._flush_gui_state()
                 self.event_timer.stop()
                 event.accept()
                 return

@@ -129,6 +129,14 @@ updates and Stop available, and requires a separate full-travel confirmation.
 A disabled Jog tab reserves space for a future implementation of the
 controller's native XA Jog.
 
+The GUI remembers each axis's maximum velocity, acceleration, and relative
+step. Changes are saved automatically to
+`~/.local/state/bbd303/gui-state.json` (or `$XDG_STATE_HOME/bbd303/gui-state.json`)
+and restored on the next connection. `Save as Default` records a separate
+per-axis preset, while `Restore Default` reloads it. Until a preset is saved,
+the built-in defaults are 1 mm/s, 10 mm/s², and a 1 µm relative step. The state
+file contains no controller serial number or network address.
+
 ## Python API
 
 ```python

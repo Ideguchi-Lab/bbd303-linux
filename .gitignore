@@ -3,6 +3,7 @@
 config.toml
 *.log
 *.jsonl
+gui-state.json
 __pycache__/
 *.py[cod]
 .pytest_cache/
