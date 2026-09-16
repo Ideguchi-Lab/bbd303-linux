@@ -24,6 +24,14 @@ class FakeBackend:
             22: SimpleNamespace(min_velocity=0, acceleration=10_000, max_velocity=20_000),
         }
         self.set_velocity_calls = []
+        self.jog = {
+            21: SimpleNamespace(mode=1, step_size=100, min_velocity=0,
+                                acceleration=5000, max_velocity=10000, stop_mode=1),
+            22: SimpleNamespace(mode=1, step_size=100, min_velocity=0,
+                                acceleration=5000, max_velocity=10000, stop_mode=1),
+        }
+        self.set_jog_calls = []
+        self.jog_moves = []
         self.moves = []
         self.stops = []
         self.home_calls = []
@@ -105,6 +113,19 @@ class FakeBackend:
             soft_limit_operating_mode=1,
         )
 
+    def jog_params(self, handle, timeout_ms):
+        return SimpleNamespace(**vars(self.jog[handle]))
+
+    def set_jog_params(self, handle, mode, step_size, minimum,
+                       acceleration, maximum, stop_mode):
+        self.set_jog_calls.append(
+            (handle, mode, step_size, minimum, acceleration, maximum, stop_mode)
+        )
+        self.jog[handle] = SimpleNamespace(
+            mode=mode, step_size=step_size, min_velocity=minimum,
+            acceleration=acceleration, max_velocity=maximum, stop_mode=stop_mode,
+        )
+
     def set_velocity_params(self, handle, minimum, acceleration, maximum):
         self.set_velocity_calls.append((handle, minimum, acceleration, maximum))
         self.velocity[handle] = SimpleNamespace(
@@ -114,6 +135,11 @@ class FakeBackend:
     def move_absolute(self, handle, position):
         self.moves.append((handle, position))
         self.positions[handle] = position
+
+    def move_jog(self, handle, forward):
+        self.jog_moves.append((handle, forward))
+        step = self.jog[handle].step_size
+        self.positions[handle] += step if forward else -step
 
     def stop(self, handle, profiled=False):
         self.stops.append((handle, profiled))
@@ -206,6 +232,49 @@ class ControllerTests(unittest.TestCase):
 
         self.assertEqual(self.backend.stops[-1], (21, False))
         self.assertEqual(self.backend.set_velocity_calls[-1], (21, 0, 10_000, 20_000))
+
+    def test_reads_scaled_jog_parameters(self):
+        params = self.controller.get_jog_parameters("x")
+        self.assertEqual(params.mode, "continuous")
+        self.assertEqual(params.step_size_mm, 0.005)
+        self.assertEqual(params.max_velocity_mm_s, 10.0)
+        self.assertEqual(params.acceleration_mm_s2, 50.0)
+        self.assertEqual(params.stop_mode, "immediate")
+
+    def test_native_single_step_jog_and_parameter_restore(self):
+        self.controller.start_jog_step(
+            "x", "forward", step_size_mm=0.01,
+            velocity_mm_s=0.1, acceleration_mm_s2=1.0,
+        )
+        self.assertEqual(self.backend.jog_moves, [(21, True)])
+        self.assertEqual(self.backend.set_jog_calls[0], (21, 2, 200, 0, 100, 100, 2))
+
+        self.assertFalse(self.controller.poll_jog_step("x")[1])
+        self.assertFalse(self.controller.poll_jog_step("x")[1])
+        status, complete = self.controller.poll_jog_step("x")
+
+        self.assertTrue(complete)
+        self.assertEqual(status.position_mm, 50.01)
+        self.assertEqual(
+            self.backend.set_jog_calls[-1], (21, 1, 100, 0, 5000, 10000, 1)
+        )
+
+    def test_reverse_jog_checks_target_and_direction(self):
+        self.controller.start_jog_step(
+            "y", "reverse", step_size_mm=0.01,
+            velocity_mm_s=0.1, acceleration_mm_s2=1.0,
+        )
+        self.assertEqual(self.backend.jog_moves[-1], (22, False))
+
+    def test_stop_restores_single_step_jog_parameters(self):
+        self.controller.start_jog_step(
+            "x", "forward", step_size_mm=0.01,
+            velocity_mm_s=0.1, acceleration_mm_s2=1.0,
+        )
+        self.controller.stop("x")
+        self.assertEqual(
+            self.backend.set_jog_calls[-1], (21, 1, 100, 0, 5000, 10000, 1)
+        )
 
     def test_refuses_motion_if_not_homed(self):
         self.backend.bits[21] &= ~0x00000400

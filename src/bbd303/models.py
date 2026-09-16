@@ -78,3 +78,20 @@ class MotionParameters:
     hard_limit_reverse_mode: int
     soft_limit_mode: int
 
+
+@dataclass(frozen=True)
+class JogParameters:
+    axis: Axis
+    mode: str
+    step_size_mm: float
+    min_velocity_mm_s: float
+    max_velocity_mm_s: float
+    acceleration_mm_s2: float
+    stop_mode: str
+    mode_raw: int
+    step_size_raw: int
+    min_velocity_raw: int
+    max_velocity_raw: int
+    acceleration_raw: int
+    stop_mode_raw: int
+

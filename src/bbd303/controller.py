@@ -11,7 +11,10 @@ from .backends import XABackend
 from .config import Config, cache_home, load_config
 from .discovery import discover
 from .errors import DeviceBusyError, DeviceStateError, MotionTimeoutError
-from .models import Axis, AxisStatus, ControllerInfo, DiscoveryResult, MotionParameters, StageInfo
+from .models import (
+    Axis, AxisStatus, ControllerInfo, DiscoveryResult, JogParameters,
+    MotionParameters, StageInfo,
+)
 from .units import to_device_units
 
 _TIMEOUT_MS = 2000
@@ -43,6 +46,13 @@ class _PendingHome:
     stable_reads: int = 0
 
 
+@dataclass
+class _PendingJog:
+    target_counts: int
+    original: tuple[int, int, int, int, int, int]
+    stable_reads: int = 0
+
+
 class BBD303Controller:
     """Connect to one configured BBD303 and its MLS203 X/Y axes."""
 
@@ -67,6 +77,7 @@ class BBD303Controller:
         self._axes: dict[Axis, _AxisRuntime] = {}
         self._pending_motions: dict[Axis, _PendingMotion] = {}
         self._pending_homes: dict[Axis, _PendingHome] = {}
+        self._pending_jogs: dict[Axis, _PendingJog] = {}
         self._lock_stream = None
 
     def __enter__(self) -> "BBD303Controller":
@@ -189,7 +200,10 @@ class BBD303Controller:
     def close(self) -> None:
         backend = self._backend
         if backend is not None:
-            active_axes = set(self._pending_motions) | set(self._pending_homes)
+            active_axes = (
+                set(self._pending_motions) | set(self._pending_homes)
+                | set(self._pending_jogs)
+            )
             for axis in active_axes:
                 try:
                     self.stop(axis)
@@ -197,6 +211,7 @@ class BBD303Controller:
                     pass
             self._pending_motions.clear()
             self._pending_homes.clear()
+            self._pending_jogs.clear()
             for runtime in list(self._axes.values()):
                 try:
                     backend.close(runtime.handle)
@@ -274,6 +289,35 @@ class BBD303Controller:
             soft_limit_mode=int(limits.soft_limit_operating_mode),
         )
 
+    def get_jog_parameters(self, axis: Axis | str) -> JogParameters:
+        parsed = Axis.parse(axis)
+        runtime = self._runtime(parsed)
+        raw = self._backend.jog_params(runtime.handle, _TIMEOUT_MS)
+        mode_raw = int(raw.mode)
+        stop_raw = int(raw.stop_mode)
+        modes = {1: "continuous", 2: "single_step"}
+        stop_modes = {1: "immediate", 2: "profiled"}
+        if mode_raw not in modes or stop_raw not in stop_modes:
+            raise DeviceStateError(
+                f"Axis {parsed.value} returned unsupported Jog parameters: "
+                f"mode={mode_raw}, stop_mode={stop_raw}"
+            )
+        return JogParameters(
+            axis=parsed,
+            mode=modes[mode_raw],
+            step_size_mm=raw.step_size / runtime.stage.counts_per_mm,
+            min_velocity_mm_s=raw.min_velocity / runtime.velocity_scale,
+            max_velocity_mm_s=raw.max_velocity / runtime.velocity_scale,
+            acceleration_mm_s2=raw.acceleration / runtime.acceleration_scale,
+            stop_mode=stop_modes[stop_raw],
+            mode_raw=mode_raw,
+            step_size_raw=int(raw.step_size),
+            min_velocity_raw=int(raw.min_velocity),
+            max_velocity_raw=int(raw.max_velocity),
+            acceleration_raw=int(raw.acceleration),
+            stop_mode_raw=stop_raw,
+        )
+
     @staticmethod
     def _require_ready(status: AxisStatus) -> None:
         if not status.homed:
@@ -342,7 +386,7 @@ class BBD303Controller:
     ) -> AxisStatus:
         """Start a move for an event loop and return without waiting for it."""
         parsed = Axis.parse(axis)
-        if parsed in self._pending_motions or parsed in self._pending_homes:
+        if parsed in (self._pending_motions | self._pending_homes | self._pending_jogs):
             raise DeviceStateError(f"Axis {parsed.value} already has an active operation")
         runtime = self._runtime(parsed)
         before = self.get_status(parsed)
@@ -397,6 +441,82 @@ class BBD303Controller:
             self._pending_motions.pop(parsed, None)
         return status, True
 
+    def _restore_jog_parameters(self, axis: Axis) -> None:
+        pending = self._pending_jogs.get(axis)
+        if pending is not None:
+            self._backend.set_jog_params(self._runtime(axis).handle, *pending.original)
+
+    def start_jog_step(
+        self,
+        axis: Axis | str,
+        direction: str,
+        *,
+        step_size_mm: float,
+        velocity_mm_s: float,
+        acceleration_mm_s2: float,
+    ) -> AxisStatus:
+        """Start one native XA Single Step Jog and return without waiting."""
+        parsed = Axis.parse(axis)
+        if parsed in (self._pending_motions | self._pending_homes | self._pending_jogs):
+            raise DeviceStateError(f"Axis {parsed.value} already has an active operation")
+        if direction not in ("forward", "reverse"):
+            raise DeviceStateError("Jog direction must be forward or reverse")
+        runtime = self._runtime(parsed)
+        before = self.get_status(parsed)
+        self._require_ready(before)
+        step = to_device_units(step_size_mm, runtime.stage.counts_per_mm)
+        if step <= 0:
+            raise DeviceStateError("Jog step size must be positive")
+        target = before.position_counts + (step if direction == "forward" else -step)
+        self._validate_target(runtime, target)
+        velocity = to_device_units(velocity_mm_s, runtime.velocity_scale)
+        acceleration = to_device_units(acceleration_mm_s2, runtime.acceleration_scale)
+        if velocity <= 0 or velocity_mm_s > runtime.stage.max_velocity_mm_s:
+            raise DeviceStateError("Jog velocity is outside the connected stage limits")
+        if acceleration <= 0 or acceleration_mm_s2 > runtime.stage.max_acceleration_mm_s2:
+            raise DeviceStateError("Jog acceleration is outside the connected stage limits")
+        raw = self._backend.jog_params(runtime.handle, _TIMEOUT_MS)
+        original = (
+            int(raw.mode), int(raw.step_size), int(raw.min_velocity),
+            int(raw.acceleration), int(raw.max_velocity), int(raw.stop_mode),
+        )
+        self._pending_jogs[parsed] = _PendingJog(target, original)
+        try:
+            self._backend.set_jog_params(
+                runtime.handle, 2, step, int(raw.min_velocity), acceleration, velocity, 2
+            )
+            self._backend.move_jog(runtime.handle, direction == "forward")
+        except BaseException:
+            try:
+                self._restore_jog_parameters(parsed)
+            finally:
+                self._pending_jogs.pop(parsed, None)
+            raise
+        return before
+
+    def poll_jog_step(self, axis: Axis | str) -> tuple[AxisStatus, bool]:
+        parsed = Axis.parse(axis)
+        status = self.get_status(parsed)
+        pending = self._pending_jogs.get(parsed)
+        if pending is None:
+            return status, True
+        if status.fault or status.forward_hard_limit or status.reverse_hard_limit:
+            try:
+                self.stop(parsed)
+            except Exception:
+                pass
+            raise DeviceStateError(f"Axis {parsed.value} faulted or reached a limit while jogging")
+        at_target = abs(status.position_counts - pending.target_counts) <= _POSITION_TOLERANCE_COUNTS
+        complete = status.settled and not status.moving and status.velocity_raw == 0 and at_target
+        pending.stable_reads = pending.stable_reads + 1 if complete else 0
+        if pending.stable_reads < 3:
+            return status, False
+        try:
+            self._restore_jog_parameters(parsed)
+        finally:
+            self._pending_jogs.pop(parsed, None)
+        return status, True
+
     def start_home(
         self,
         axis: Axis | str,
@@ -408,7 +528,7 @@ class BBD303Controller:
         parsed = Axis.parse(axis)
         if not confirmed:
             raise DeviceStateError("Home requires explicit confirmation")
-        if parsed in self._pending_motions or parsed in self._pending_homes:
+        if parsed in (self._pending_motions | self._pending_homes | self._pending_jogs):
             raise DeviceStateError(f"Axis {parsed.value} already has an active operation")
         before = self.get_status(parsed)
         if not before.enabled or before.moving or before.fault:
@@ -526,6 +646,14 @@ class BBD303Controller:
                             self._pending_motions.pop(item, None)
                 if item in self._pending_homes:
                     self._pending_homes.pop(item, None)
+                if item in self._pending_jogs:
+                    try:
+                        self.wait_until_settled(item, timeout_s=3.0)
+                    finally:
+                        try:
+                            self._restore_jog_parameters(item)
+                        finally:
+                            self._pending_jogs.pop(item, None)
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
@@ -551,7 +679,7 @@ class BBD303Controller:
     def home(self, axis: Axis | str, *, confirmed: bool = False,
              timeout_s: float = 180.0) -> AxisStatus:
         parsed = Axis.parse(axis)
-        if parsed in self._pending_motions or parsed in self._pending_homes:
+        if parsed in (self._pending_motions | self._pending_homes | self._pending_jogs):
             raise DeviceStateError(f"Axis {parsed.value} already has an active operation")
         if not confirmed:
             raise DeviceStateError("Home requires explicit confirmation")

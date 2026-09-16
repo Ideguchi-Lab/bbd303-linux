@@ -2,7 +2,9 @@
 
 from .config import Config, load_config
 from .controller import BBD303Controller
-from .models import Axis, AxisStatus, ControllerInfo, MotionParameters, StageInfo
+from .models import (
+    Axis, AxisStatus, ControllerInfo, JogParameters, MotionParameters, StageInfo,
+)
 
 __all__ = [
     "Axis",
@@ -10,6 +12,7 @@ __all__ = [
     "BBD303Controller",
     "Config",
     "ControllerInfo",
+    "JogParameters",
     "MotionParameters",
     "StageInfo",
     "load_config",
