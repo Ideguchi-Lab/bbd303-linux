@@ -121,20 +121,17 @@ def main(argv: list[str] | None = None) -> int:
                 self._close_controller()
                 self.event_queue.put(("connection_lost", str(exc)))
 
-        def _start_move(self, axis, value, velocity, acceleration, *, relative):
+        @QtCore.Slot(str, float, float, float)
+        def move_absolute(self, axis, position_mm, velocity_mm_s, acceleration_mm_s2):
             if self.controller is None:
                 self.event_queue.put(("operation_failed", "Controller is not connected"))
                 return
             parsed = Axis.parse(axis)
             try:
-                method = (
-                    self.controller.start_move_relative
-                    if relative else self.controller.start_move_absolute
-                )
-                status = method(
-                    parsed, value,
-                    velocity_mm_s=velocity,
-                    acceleration_mm_s2=acceleration,
+                status = self.controller.start_move_absolute(
+                    parsed, position_mm,
+                    velocity_mm_s=velocity_mm_s,
+                    acceleration_mm_s2=acceleration_mm_s2,
                 )
                 self.active_operations[parsed] = "move"
                 self.event_queue.put(("operation_started", (parsed, "move")))
@@ -142,18 +139,6 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:
                 self.event_queue.put(("operation_finished", parsed))
                 self.event_queue.put(("operation_failed", str(exc)))
-
-        @QtCore.Slot(str, float, float, float)
-        def move_absolute(self, axis, position_mm, velocity_mm_s, acceleration_mm_s2):
-            self._start_move(
-                axis, position_mm, velocity_mm_s, acceleration_mm_s2, relative=False
-            )
-
-        @QtCore.Slot(str, float, float, float)
-        def move_relative(self, axis, distance_mm, velocity_mm_s, acceleration_mm_s2):
-            self._start_move(
-                axis, distance_mm, velocity_mm_s, acceleration_mm_s2, relative=True
-            )
 
         @QtCore.Slot(str, str, float, float, float)
         def jog_step(
@@ -246,7 +231,6 @@ def main(argv: list[str] | None = None) -> int:
 
     class AxisPanel(QtWidgets.QGroupBox):
         absolute_requested = QtCore.Signal(str, float, float, float)
-        relative_requested = QtCore.Signal(str, float, float, float)
         jog_requested = QtCore.Signal(str, str, float, float, float)
         stop_requested = QtCore.Signal(str)
         enabled_requested = QtCore.Signal(str, bool)
@@ -299,15 +283,6 @@ def main(argv: list[str] | None = None) -> int:
             self.move_button = QtWidgets.QPushButton("Execute")
             self.move_button.clicked.connect(self._absolute)
 
-            self.step = QtWidgets.QDoubleSpinBox()
-            self.step.setDecimals(1)
-            self.step.setRange(0.1, 100000.0)
-            self.step.setValue(1.0)
-            self.step.setSuffix(" µm")
-            self.minus_button = QtWidgets.QPushButton("−")
-            self.plus_button = QtWidgets.QPushButton("+")
-            self.minus_button.clicked.connect(lambda: self._relative(-1))
-            self.plus_button.clicked.connect(lambda: self._relative(1))
             self.save_default_button = QtWidgets.QPushButton("Save as Default")
             self.restore_default_button = QtWidgets.QPushButton("Restore Default")
             self.save_default_button.clicked.connect(
@@ -316,7 +291,7 @@ def main(argv: list[str] | None = None) -> int:
             self.restore_default_button.clicked.connect(
                 lambda: self.restore_default_requested.emit(self.axis)
             )
-            for field in (self.velocity, self.acceleration, self.step):
+            for field in (self.velocity, self.acceleration):
                 field.valueChanged.connect(lambda _value: self.settings_changed.emit(self.axis))
 
             move_page = QtWidgets.QWidget()
@@ -328,23 +303,16 @@ def main(argv: list[str] | None = None) -> int:
             move_layout.addWidget(QtWidgets.QLabel("Acceleration"), 2, 0)
             move_layout.addWidget(self.acceleration, 2, 1, 1, 2)
             move_layout.addWidget(self.move_button, 3, 1, 1, 2)
-            move_layout.addWidget(QtWidgets.QLabel("Relative step"), 4, 0)
-            move_layout.addWidget(self.step, 4, 1, 1, 2)
-            move_layout.addWidget(self.minus_button, 5, 1)
-            move_layout.addWidget(self.plus_button, 5, 2)
             defaults_row = QtWidgets.QHBoxLayout()
             defaults_row.addWidget(self.save_default_button)
             defaults_row.addWidget(self.restore_default_button)
-            move_layout.addLayout(defaults_row, 6, 0, 1, 3)
-            move_layout.setRowStretch(7, 1)
+            move_layout.addLayout(defaults_row, 4, 0, 1, 3)
+            move_layout.setRowStretch(5, 1)
 
             self.jog_mode = QtWidgets.QComboBox()
             self.jog_mode.addItem("Single Step", "single_step")
-            self.jog_step_size = QtWidgets.QDoubleSpinBox()
-            self.jog_step_size.setDecimals(1)
-            self.jog_step_size.setRange(0.1, 100000.0)
-            self.jog_step_size.setValue(1.0)
-            self.jog_step_size.setSuffix(" µm")
+            self.jog_mode.addItem("Continuous (unavailable)", "continuous")
+            self.jog_mode.model().item(1).setEnabled(False)
             self.jog_velocity = QtWidgets.QDoubleSpinBox()
             self.jog_velocity.setDecimals(4)
             self.jog_velocity.setMinimum(0.0001)
@@ -353,10 +321,25 @@ def main(argv: list[str] | None = None) -> int:
             self.jog_acceleration.setDecimals(3)
             self.jog_acceleration.setMinimum(0.001)
             self.jog_acceleration.setSuffix(" mm/s²")
-            self.jog_reverse_button = QtWidgets.QPushButton("◀")
-            self.jog_forward_button = QtWidgets.QPushButton("▶")
-            self.jog_reverse_button.clicked.connect(lambda: self._jog("reverse"))
-            self.jog_forward_button.clicked.connect(lambda: self._jog("forward"))
+            self.jog_buttons = []
+            self.jog_step_fields = []
+            self.edit_steps_button = QtWidgets.QPushButton("Edit steps…")
+            self.edit_steps_button.setCheckable(True)
+            self.edit_steps_button.toggled.connect(self._toggle_step_editor)
+            self.step_editor = QtWidgets.QWidget()
+            editor_layout = QtWidgets.QGridLayout(self.step_editor)
+            editor_layout.setContentsMargins(0, 0, 0, 0)
+            for index, value in enumerate((1.0, 5.0, 10.0, 50.0)):
+                field = QtWidgets.QDoubleSpinBox()
+                field.setDecimals(2)
+                field.setRange(0.05, 100000.0)
+                field.setValue(value)
+                field.setSuffix(" µm")
+                field.valueChanged.connect(self._step_value_changed)
+                self.jog_step_fields.append(field)
+                editor_layout.addWidget(QtWidgets.QLabel(f"Step {index + 1}"), index, 0)
+                editor_layout.addWidget(field, index, 1)
+            self.step_editor.hide()
             self.save_jog_default_button = QtWidgets.QPushButton("Save as Default")
             self.restore_jog_default_button = QtWidgets.QPushButton("Restore Default")
             self.save_jog_default_button.clicked.connect(
@@ -365,36 +348,40 @@ def main(argv: list[str] | None = None) -> int:
             self.restore_jog_default_button.clicked.connect(
                 lambda: self.restore_jog_default_requested.emit(self.axis)
             )
-            for field in (
-                self.jog_mode,
-                self.jog_step_size,
-                self.jog_velocity,
-                self.jog_acceleration,
-            ):
-                signal = (
-                    field.currentIndexChanged
-                    if field is self.jog_mode else field.valueChanged
-                )
-                signal.connect(lambda _value: self.settings_changed.emit(self.axis))
+            for field in (self.jog_velocity, self.jog_acceleration):
+                field.valueChanged.connect(lambda _value: self.settings_changed.emit(self.axis))
 
             jog_page = QtWidgets.QWidget()
             jog_layout = QtWidgets.QGridLayout(jog_page)
             jog_layout.addWidget(QtWidgets.QLabel("Mode"), 0, 0)
             jog_layout.addWidget(self.jog_mode, 0, 1, 1, 2)
-            jog_layout.addWidget(QtWidgets.QLabel("Step size"), 1, 0)
-            jog_layout.addWidget(self.jog_step_size, 1, 1, 1, 2)
-            jog_layout.addWidget(QtWidgets.QLabel("Maximum velocity"), 2, 0)
-            jog_layout.addWidget(self.jog_velocity, 2, 1, 1, 2)
-            jog_layout.addWidget(QtWidgets.QLabel("Acceleration"), 3, 0)
-            jog_layout.addWidget(self.jog_acceleration, 3, 1, 1, 2)
-            jog_layout.addWidget(QtWidgets.QLabel("Execute"), 4, 0)
-            jog_layout.addWidget(self.jog_reverse_button, 4, 1)
-            jog_layout.addWidget(self.jog_forward_button, 4, 2)
+            jog_layout.addWidget(QtWidgets.QLabel("Maximum velocity"), 1, 0)
+            jog_layout.addWidget(self.jog_velocity, 1, 1, 1, 2)
+            jog_layout.addWidget(QtWidgets.QLabel("Acceleration"), 2, 0)
+            jog_layout.addWidget(self.jog_acceleration, 2, 1, 1, 2)
+            jog_layout.addWidget(QtWidgets.QLabel("Reverse  ◀"), 3, 0)
+            jog_layout.addWidget(QtWidgets.QLabel("Forward  ▶"), 3, 2)
+            for index in range(4):
+                reverse = QtWidgets.QPushButton()
+                forward = QtWidgets.QPushButton()
+                reverse.clicked.connect(
+                    lambda _checked=False, i=index: self._jog_step(i, "reverse")
+                )
+                forward.clicked.connect(
+                    lambda _checked=False, i=index: self._jog_step(i, "forward")
+                )
+                self.jog_buttons.append((reverse, forward))
+                jog_layout.addWidget(reverse, index + 4, 0)
+                jog_layout.addWidget(QtWidgets.QLabel(f"Step {index + 1}"), index + 4, 1)
+                jog_layout.addWidget(forward, index + 4, 2)
+            self._update_jog_button_labels()
+            jog_layout.addWidget(self.edit_steps_button, 8, 0, 1, 3)
+            jog_layout.addWidget(self.step_editor, 9, 0, 1, 3)
             jog_defaults_row = QtWidgets.QHBoxLayout()
             jog_defaults_row.addWidget(self.save_jog_default_button)
             jog_defaults_row.addWidget(self.restore_jog_default_button)
-            jog_layout.addLayout(jog_defaults_row, 5, 0, 1, 3)
-            jog_layout.setRowStretch(6, 1)
+            jog_layout.addLayout(jog_defaults_row, 10, 0, 1, 3)
+            jog_layout.setRowStretch(11, 1)
 
             tabs = QtWidgets.QTabWidget()
             tabs.addTab(move_page, "Move")
@@ -426,8 +413,8 @@ def main(argv: list[str] | None = None) -> int:
             maximum_step_um = (
                 stage.max_position_mm - stage.min_position_mm
             ) * 1000.0
-            self.step.setMaximum(maximum_step_um)
-            self.jog_step_size.setMaximum(maximum_step_um)
+            for field in self.jog_step_fields:
+                field.setMaximum(maximum_step_um)
             self.jog_velocity.setRange(0.0001, stage.max_velocity_mm_s)
             self.jog_acceleration.setRange(0.001, stage.max_acceleration_mm_s2)
             self.apply_settings(settings)
@@ -439,41 +426,54 @@ def main(argv: list[str] | None = None) -> int:
             blockers = [
                 QtCore.QSignalBlocker(self.velocity),
                 QtCore.QSignalBlocker(self.acceleration),
-                QtCore.QSignalBlocker(self.step),
             ]
             self.velocity.setValue(settings.velocity_mm_s)
             self.acceleration.setValue(settings.acceleration_mm_s2)
-            self.step.setValue(settings.relative_step_um)
             del blockers
 
         def current_settings(self):
             return GuiAxisSettings(
                 velocity_mm_s=self.velocity.value(),
                 acceleration_mm_s2=self.acceleration.value(),
-                relative_step_um=self.step.value(),
             )
 
         def apply_jog_settings(self, settings):
-            blockers = [
-                QtCore.QSignalBlocker(self.jog_mode),
-                QtCore.QSignalBlocker(self.jog_step_size),
-                QtCore.QSignalBlocker(self.jog_velocity),
-                QtCore.QSignalBlocker(self.jog_acceleration),
-            ]
-            index = self.jog_mode.findData(settings.mode)
-            self.jog_mode.setCurrentIndex(max(index, 0))
-            self.jog_step_size.setValue(settings.step_size_um)
+            fields = [self.jog_velocity, self.jog_acceleration, *self.jog_step_fields]
+            blockers = [QtCore.QSignalBlocker(field) for field in fields]
+            self.jog_mode.setCurrentIndex(0)
             self.jog_velocity.setValue(settings.velocity_mm_s)
             self.jog_acceleration.setValue(settings.acceleration_mm_s2)
+            for field, value in zip(self.jog_step_fields, settings.steps_um):
+                field.setValue(value)
+            self._update_jog_button_labels()
             del blockers
 
         def current_jog_settings(self):
             return GuiJogSettings(
-                mode=self.jog_mode.currentData(),
-                step_size_um=self.jog_step_size.value(),
+                mode="single_step",
+                step_size_um=self.jog_step_fields[0].value(),
                 velocity_mm_s=self.jog_velocity.value(),
                 acceleration_mm_s2=self.jog_acceleration.value(),
+                steps_um=tuple(field.value() for field in self.jog_step_fields),
             )
+
+        def _toggle_step_editor(self, expanded):
+            self.step_editor.setVisible(expanded)
+            self.edit_steps_button.setText(
+                "Hide step editor" if expanded else "Edit steps…"
+            )
+
+        def _step_value_changed(self, _value):
+            self._update_jog_button_labels()
+            self.settings_changed.emit(self.axis)
+
+        def _update_jog_button_labels(self):
+            for field, (reverse, forward) in zip(
+                self.jog_step_fields, self.jog_buttons
+            ):
+                value = f"{field.value():g}"
+                reverse.setText(f"−{value} µm")
+                forward.setText(f"+{value} µm")
 
         def set_connected(self, connected):
             self.connected = connected
@@ -488,17 +488,17 @@ def main(argv: list[str] | None = None) -> int:
             self._update_controls()
 
         def _update_controls(self):
-            move_enabled = self.connected and not self.motion_active
+            idle = self.connected and not self.motion_active
             for widget in (
                 self.target, self.velocity, self.acceleration, self.move_button,
-                self.step, self.minus_button, self.plus_button, self.enable_button,
+                self.enable_button,
                 self.home_button, self.save_default_button, self.restore_default_button,
-                self.jog_mode, self.jog_step_size, self.jog_velocity,
-                self.jog_acceleration, self.jog_reverse_button,
-                self.jog_forward_button, self.save_jog_default_button,
-                self.restore_jog_default_button,
+                self.jog_mode, self.jog_velocity, self.jog_acceleration,
+                self.edit_steps_button, self.save_jog_default_button,
+                self.restore_jog_default_button, *self.jog_step_fields,
+                *(button for pair in self.jog_buttons for button in pair),
             ):
-                widget.setEnabled(move_enabled)
+                widget.setEnabled(idle)
             self.stop_button.setEnabled(self.connected)
 
         def update_status(self, status):
@@ -540,15 +540,13 @@ def main(argv: list[str] | None = None) -> int:
                 velocity, acceleration = self._parameters()
                 self.absolute_requested.emit(self.axis, target, velocity, acceleration)
 
-        def _relative(self, direction):
-            distance = direction * self.step.value() / 1000.0
+        def _jog_step(self, index, direction):
+            if not self.connected or self.motion_active:
+                return
+            distance = self.jog_step_fields[index].value() / 1000.0
             if self._confirm_distance(distance):
-                velocity, acceleration = self._parameters()
-                self.relative_requested.emit(self.axis, distance, velocity, acceleration)
-
-        def _jog(self, direction):
-            distance = self.jog_step_size.value() / 1000.0
-            if self._confirm_distance(distance):
+                self.motion_active = True
+                self._update_controls()
                 self.jog_requested.emit(
                     self.axis,
                     direction,
@@ -579,7 +577,6 @@ def main(argv: list[str] | None = None) -> int:
         connect_requested = QtCore.Signal()
         shutdown_requested = QtCore.Signal()
         absolute_requested = QtCore.Signal(str, float, float, float)
-        relative_requested = QtCore.Signal(str, float, float, float)
         jog_requested = QtCore.Signal(str, str, float, float, float)
         stop_requested = QtCore.Signal(str)
         enabled_requested = QtCore.Signal(str, bool)
@@ -606,7 +603,6 @@ def main(argv: list[str] | None = None) -> int:
             for panel in self.panels.values():
                 axes_layout.addWidget(panel)
                 panel.absolute_requested.connect(self.absolute_requested)
-                panel.relative_requested.connect(self.relative_requested)
                 panel.jog_requested.connect(self.jog_requested)
                 panel.stop_requested.connect(self.stop_requested)
                 panel.enabled_requested.connect(self.enabled_requested)
@@ -810,7 +806,6 @@ def main(argv: list[str] | None = None) -> int:
     window.connect_requested.connect(worker.connect_device, queued)
     window.shutdown_requested.connect(worker.shutdown, queued)
     window.absolute_requested.connect(worker.move_absolute, queued)
-    window.relative_requested.connect(worker.move_relative, queued)
     window.jog_requested.connect(worker.jog_step, queued)
     window.stop_requested.connect(worker.stop_axis, queued)
     window.enabled_requested.connect(worker.set_enabled, queued)

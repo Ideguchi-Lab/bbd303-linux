@@ -17,7 +17,6 @@ _STATE_VERSION = 1
 class GuiAxisSettings:
     velocity_mm_s: float
     acceleration_mm_s2: float
-    relative_step_um: float
 
 
 @dataclass(frozen=True)
@@ -26,12 +25,12 @@ class GuiJogSettings:
     step_size_um: float
     velocity_mm_s: float
     acceleration_mm_s2: float
+    steps_um: tuple[float, float, float, float] = (1.0, 5.0, 10.0, 50.0)
 
 
 BUILTIN_DEFAULTS = GuiAxisSettings(
     velocity_mm_s=1.0,
     acceleration_mm_s2=10.0,
-    relative_step_um=1.0,
 )
 
 BUILTIN_JOG_DEFAULTS = GuiJogSettings(
@@ -39,6 +38,7 @@ BUILTIN_JOG_DEFAULTS = GuiJogSettings(
     step_size_um=1.0,
     velocity_mm_s=1.0,
     acceleration_mm_s2=10.0,
+    steps_um=(1.0, 5.0, 10.0, 50.0),
 )
 
 
@@ -55,7 +55,6 @@ def _settings_from_mapping(value) -> GuiAxisSettings | None:
         settings = GuiAxisSettings(
             velocity_mm_s=float(value["velocity_mm_s"]),
             acceleration_mm_s2=float(value["acceleration_mm_s2"]),
-            relative_step_um=float(value["relative_step_um"]),
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -68,11 +67,19 @@ def _jog_settings_from_mapping(value) -> GuiJogSettings | None:
     if not isinstance(value, dict):
         return None
     try:
+        raw_steps = value.get("steps_um", (1.0, 5.0, 10.0, 50.0))
+        if not isinstance(raw_steps, (list, tuple)) or len(raw_steps) != 4:
+            return None
+        steps = tuple(float(item) for item in raw_steps)
+        mode = str(value["mode"])
+        if mode not in ("single_step", "continuous"):
+            return None
         settings = GuiJogSettings(
-            mode=str(value["mode"]),
+            mode="single_step",  # Migrate saved Continuous mode to the usable mode.
             step_size_um=float(value["step_size_um"]),
             velocity_mm_s=float(value["velocity_mm_s"]),
             acceleration_mm_s2=float(value["acceleration_mm_s2"]),
+            steps_um=steps,
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -80,10 +87,9 @@ def _jog_settings_from_mapping(value) -> GuiJogSettings | None:
         settings.step_size_um,
         settings.velocity_mm_s,
         settings.acceleration_mm_s2,
+        *settings.steps_um,
     )
-    if settings.mode != "single_step" or not all(
-        math.isfinite(item) and item > 0 for item in numbers
-    ):
+    if not all(math.isfinite(item) and item > 0 for item in numbers):
         return None
     return settings
 
@@ -173,7 +179,7 @@ class GuiStateStore:
     def _set_jog(self, axis: Axis | str, name: str, settings: GuiJogSettings) -> None:
         validated = _jog_settings_from_mapping(asdict(settings))
         if validated is None:
-            raise ValueError("Jog settings must use Single Step and finite positive numbers")
+            raise ValueError("Jog settings must use a supported mode and finite positive numbers")
         key = Axis.parse(axis).value
         self._jogs.setdefault(key, {})[name] = validated
 

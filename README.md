@@ -12,13 +12,14 @@ The implementation currently covers the everyday functions from the XA GUI:
 - absolute and relative moves
 - immediate or profiled stop and enable/disable
 - a small PySide6 GUI with live X/Y positions and hardware-state indicators,
-  absolute moves, relative micro-steps, speed/acceleration controls,
-  official XA Single Step Jog, enable/disable, and an always-responsive Stop button
+  absolute moves, speed/acceleration controls, official XA Single Step Jog
+  with four editable presets, enable/disable,
+  and an always-responsive Stop button
 - guarded Home commands in the CLI and GUI
 
-Continuous Jog, path movement, raster scans, synchronization, triggers,
-persistent device-parameter editing, and firmware updates are outside the first
-release.
+Continuous Jog is disabled pending a reliable stop path. Path movement, raster
+scans, synchronization, triggers, persistent device-parameter editing, and
+firmware updates are outside the first release.
 
 ## Install
 
@@ -127,18 +128,22 @@ previous values at completion, after Stop, on error, and during shutdown.
 Commands that differ from the last read position by more than 1 mm show a
 confirmation dialog. GUI Home also runs asynchronously, keeps live position
 updates and Stop available, and requires a separate full-travel confirmation.
-The Jog tab implements the controller's native XA Single Step mode. Each arrow
-click issues one official `move_jog` command in the selected direction. Holding an
-arrow does not repeat, and Continuous mode remains reserved for later testing.
+The Move tab provides absolute positioning. The Jog tab implements native XA
+Single Step movement through four paired
+reverse/forward buttons. The built-in steps are 1, 5, 10, and 50 µm; each click
+issues one `move_jog` command. Use **Edit steps…** to change the four values
+for an axis. Continuous remains visible but disabled because its stop timing
+was not reliable in the lab.
 
-The GUI remembers each axis's Move velocity, acceleration, and relative step,
-as well as its Jog mode, step size, velocity, and acceleration. Changes are saved
+The GUI remembers each axis's Move velocity and acceleration, as well as its
+four Jog steps, velocity, and acceleration. Changes are saved
 automatically to
 `~/.local/state/bbd303/gui-state.json` (or `$XDG_STATE_HOME/bbd303/gui-state.json`)
 and restored on the next connection. `Save as Default` records a separate
 per-axis preset, while `Restore Default` reloads it. Until a preset is saved,
-the built-in defaults for both pages use 1 mm/s, 10 mm/s², and a 1 µm step.
-Move and Jog have separate per-axis presets. The state file contains no controller
+the built-in Move defaults are 1 mm/s and 10 mm/s². Jog defaults use the
+same velocity and acceleration with four steps:
+1, 5, 10, and 50 µm. Move and Jog have separate per-axis presets. The state file contains no controller
 serial number or network address. Jog parameters written to the controller are
 temporary and its previous values are restored after completion, Stop, error, or
 shutdown.

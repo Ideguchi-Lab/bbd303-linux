@@ -30,10 +30,12 @@ class GuiStateStoreTests(unittest.TestCase):
 
     def test_round_trip_keeps_last_values_and_defaults_separate(self):
         store = GuiStateStore(self.path)
-        last = GuiAxisSettings(0.1, 1.0, 10.0)
-        defaults = GuiAxisSettings(1.0, 10.0, 2.0)
-        jog_last = GuiJogSettings("single_step", 10.0, 0.1, 1.0)
-        jog_defaults = GuiJogSettings("single_step", 2.0, 1.0, 10.0)
+        last = GuiAxisSettings(0.1, 1.0)
+        defaults = GuiAxisSettings(1.0, 10.0)
+        jog_last = GuiJogSettings("single_step", 10.0, 0.1, 1.0,
+                                  (1.0, 5.0, 10.0, 50.0))
+        jog_defaults = GuiJogSettings("single_step", 2.0, 1.0, 10.0,
+                                      (0.5, 2.0, 7.0, 25.0))
         store.set_last("x", last)
         store.set_defaults("x", defaults)
         store.set_jog_last("x", jog_last)
@@ -86,15 +88,33 @@ class GuiStateStoreTests(unittest.TestCase):
 
         store = GuiStateStore(self.path)
 
-        self.assertEqual(store.last("x"), GuiAxisSettings(0.2, 2.0, 5.0))
+        self.assertEqual(store.last("x"), GuiAxisSettings(0.2, 2.0))
         self.assertEqual(store.jog_last("x"), BUILTIN_JOG_DEFAULTS)
 
-    def test_invalid_jog_mode_is_ignored(self):
+    def test_saved_continuous_mode_is_migrated_to_single_step(self):
         self.path.parent.mkdir(parents=True)
         self.path.write_text(json.dumps({
             "version": 1,
             "axes": {"x": {"jog": {"last": {
                 "mode": "continuous",
+                "step_size_um": 1,
+                "velocity_mm_s": 0.1,
+                "acceleration_mm_s2": 1,
+            }}}},
+        }), encoding="utf-8")
+
+        store = GuiStateStore(self.path)
+
+        self.assertEqual(store.jog_last("x").mode, "single_step")
+        self.assertEqual(store.jog_last("x").velocity_mm_s, 0.1)
+        self.assertEqual(store.jog_last("x").steps_um, (1.0, 5.0, 10.0, 50.0))
+
+    def test_unsupported_jog_mode_is_ignored(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({
+            "version": 1,
+            "axes": {"x": {"jog": {"last": {
+                "mode": "unsupported",
                 "step_size_um": 1,
                 "velocity_mm_s": 1,
                 "acceleration_mm_s2": 10,
