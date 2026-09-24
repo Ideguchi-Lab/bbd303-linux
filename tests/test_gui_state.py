@@ -51,6 +51,40 @@ class GuiStateStoreTests(unittest.TestCase):
         self.assertEqual(loaded.jog_last("y"), BUILTIN_JOG_DEFAULTS)
         self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
 
+    def test_positions_round_trip_update_and_delete(self):
+        store = GuiStateStore(self.path)
+        first = store.add_position("Image A", 58.23, 42.25)
+        second = store.add_position("", 58.24, 42.26)
+        store.save()
+
+        loaded = GuiStateStore(self.path)
+        self.assertEqual(loaded.positions, (first, second))
+        self.assertIsNotNone(first.saved_at)
+        self.assertIn("+", first.saved_at)
+        self.assertEqual(second.label, "")
+
+        updated = loaded.update_position(first.id, "Image B", 58.25, 42.27)
+        self.assertEqual(updated.id, first.id)
+        self.assertEqual(updated.label, "Image B")
+        self.assertEqual((updated.x_mm, updated.y_mm), (58.25, 42.27))
+        loaded.delete_position(second.id)
+        loaded.save()
+        self.assertEqual(GuiStateStore(self.path).positions, (updated,))
+
+    def test_invalid_position_is_not_saved_or_loaded(self):
+        store = GuiStateStore(self.path)
+        with self.assertRaises(ValueError):
+            store.add_position("bad", float("nan"), 1.0)
+        self.assertEqual(store.positions, ())
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({
+            "version": 1,
+            "axes": {},
+            "positions": [{"id": "old", "label": "bad", "saved_at": "invalid",
+                           "x_mm": 1, "y_mm": 2}],
+        }), encoding="utf-8")
+        self.assertEqual(GuiStateStore(self.path).positions, ())
+
     def test_corrupt_file_reports_warning_and_uses_defaults(self):
         self.path.parent.mkdir(parents=True)
         self.path.write_text("not json", encoding="utf-8")

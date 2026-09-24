@@ -135,6 +135,14 @@ issues one `move_jog` command. Use **Edit steps…** to change the four values
 for an axis. Continuous remains visible but disabled because its stop timing
 was not reliable in the lab.
 
+The **Positions** tab stores named or unnamed X/Y coordinate pairs with the
+local save time. **Save current** records both stationary axes; **Update
+selected** replaces the selected coordinates, label, and timestamp; **Delete**
+removes it. **Go** moves X and then Y using each axis's current Move velocity
+and acceleration. Moves over 1 mm require confirmation, and either STOP button
+cancels the remaining route. Saved positions are local GUI data, so check that
+the physical setup and travel path still match before returning to one.
+
 The GUI remembers each axis's Move velocity and acceleration, as well as its
 four Jog steps, velocity, and acceleration. Changes are saved
 automatically to

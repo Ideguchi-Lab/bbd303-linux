@@ -1,11 +1,13 @@
 """Persistent, device-independent settings for the GUI."""
 
 from dataclasses import asdict, dataclass
+from datetime import datetime
 import json
 import math
 import os
 from pathlib import Path
 import tempfile
+from uuid import uuid4
 
 from .models import Axis
 
@@ -26,6 +28,15 @@ class GuiJogSettings:
     velocity_mm_s: float
     acceleration_mm_s2: float
     steps_um: tuple[float, float, float, float] = (1.0, 5.0, 10.0, 50.0)
+
+
+@dataclass(frozen=True)
+class SavedPosition:
+    id: str
+    label: str
+    saved_at: str
+    x_mm: float
+    y_mm: float
 
 
 BUILTIN_DEFAULTS = GuiAxisSettings(
@@ -94,6 +105,31 @@ def _jog_settings_from_mapping(value) -> GuiJogSettings | None:
     return settings
 
 
+def _position_from_mapping(value) -> SavedPosition | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        position = SavedPosition(
+            id=str(value["id"]),
+            label=str(value["label"]),
+            saved_at=str(value["saved_at"]),
+            x_mm=float(value["x_mm"]),
+            y_mm=float(value["y_mm"]),
+        )
+        timestamp = datetime.fromisoformat(position.saved_at)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        not position.id or len(position.id) > 64
+        or len(position.label) > 80 or "\n" in position.label
+        or timestamp.tzinfo is None
+        or not math.isfinite(position.x_mm)
+        or not math.isfinite(position.y_mm)
+    ):
+        return None
+    return position
+
+
 class GuiStateStore:
     """Load and atomically save last-used and user-default GUI values."""
 
@@ -102,6 +138,7 @@ class GuiStateStore:
         self.warning: str | None = None
         self._axes: dict[str, dict[str, GuiAxisSettings]] = {}
         self._jogs: dict[str, dict[str, GuiJogSettings]] = {}
+        self._positions: list[SavedPosition] = []
         self._load()
 
     def _load(self) -> None:
@@ -115,6 +152,14 @@ class GuiStateStore:
                 payload.get("axes"), dict
             ):
                 raise ValueError("unsupported or missing state version")
+            raw_positions = payload.get("positions", [])
+            if isinstance(raw_positions, list):
+                seen_ids = set()
+                for raw in raw_positions:
+                    position = _position_from_mapping(raw)
+                    if position is not None and position.id not in seen_ids:
+                        self._positions.append(position)
+                        seen_ids.add(position.id)
             for axis in Axis:
                 raw_axis = payload["axes"].get(axis.value, {})
                 if not isinstance(raw_axis, dict):
@@ -140,6 +185,49 @@ class GuiStateStore:
             self.warning = f"Could not read GUI settings; using defaults: {exc}"
             self._axes = {}
             self._jogs = {}
+            self._positions = []
+
+    @property
+    def positions(self) -> tuple[SavedPosition, ...]:
+        return tuple(self._positions)
+
+    def add_position(self, label: str, x_mm: float, y_mm: float) -> SavedPosition:
+        position = _position_from_mapping({
+            "id": uuid4().hex,
+            "label": label.strip(),
+            "saved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "x_mm": x_mm,
+            "y_mm": y_mm,
+        })
+        if position is None:
+            raise ValueError("Position must have finite coordinates and a short label")
+        self._positions.append(position)
+        return position
+
+    def update_position(
+        self, position_id: str, label: str, x_mm: float, y_mm: float
+    ) -> SavedPosition:
+        for index, existing in enumerate(self._positions):
+            if existing.id == position_id:
+                position = _position_from_mapping({
+                    "id": position_id,
+                    "label": label.strip(),
+                    "saved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                    "x_mm": x_mm,
+                    "y_mm": y_mm,
+                })
+                if position is None:
+                    raise ValueError("Position must have finite coordinates and a short label")
+                self._positions[index] = position
+                return position
+        raise ValueError("Saved position no longer exists")
+
+    def delete_position(self, position_id: str) -> None:
+        for index, position in enumerate(self._positions):
+            if position.id == position_id:
+                self._positions.pop(index)
+                return
+        raise ValueError("Saved position no longer exists")
 
     def defaults(self, axis: Axis | str) -> GuiAxisSettings:
         key = Axis.parse(axis).value
@@ -198,7 +286,11 @@ class GuiStateStore:
             if jog_groups:
                 groups["jog"] = jog_groups
             axes[axis] = groups
-        payload = {"version": _STATE_VERSION, "axes": axes}
+        payload = {
+            "version": _STATE_VERSION,
+            "axes": axes,
+            "positions": [asdict(position) for position in self._positions],
+        }
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         temporary_name = None
         try:
